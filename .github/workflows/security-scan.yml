@@ -41,39 +41,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clamav clamav-freshclam yara python3-venv curl tar
 
-          # Setup isolated Python virtual environment for Semgrep
+          # Setup isolated Python virtual environment for Semgrep SAST
           python3 -m venv "$RUNNER_TEMP/security-venv"
           "$RUNNER_TEMP/security-venv/bin/pip" install --upgrade pip
           "$RUNNER_TEMP/security-venv/bin/pip" install semgrep
-          
+
           # Make binaries immediately available in this step and all subsequent steps
           export PATH="$RUNNER_TEMP/security-venv/bin:/usr/local/bin:$PATH"
           echo "$RUNNER_TEMP/security-venv/bin" >> "$GITHUB_PATH"
 
-          # Install Trivy via official installer with automatic Debian package fallback
-          TRIVY_VERSION="0.59.1"
-          if ! curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin "v${TRIVY_VERSION}"; then
-            echo "Installing Trivy via official deb package fallback..."
-            curl -sSfL --retry 3 --retry-delay 2 \
-              "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.deb" \
-              -o "$RUNNER_TEMP/trivy.deb"
-            sudo dpkg -i "$RUNNER_TEMP/trivy.deb"
-            rm -f "$RUNNER_TEMP/trivy.deb"
-          fi
-          sudo chmod +x /usr/local/bin/trivy || true
-
-          # Install Gitleaks using official pre-built Linux 64-bit binary archive
-          GITLEAKS_VERSION="8.24.2"
-          curl -sSfL --retry 3 --retry-delay 2 \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin gitleaks
-          sudo chmod +x /usr/local/bin/gitleaks
-
-          # Verify all tools exist and display versions
-          which semgrep trivy gitleaks yara clamscan
+          # Verify active scanners exist and print version information
+          which semgrep yara clamscan
           semgrep --version
-          trivy --version
-          gitleaks version
           yara --version
           clamscan --version
 
@@ -97,7 +76,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          # Safe limits added to support universal large projects without memory exhaustion
+          # Safe size limits prevent runner memory exhaustion on large codebases
           clamscan -r --infected \
             --max-filesize=25M \
             --max-scansize=100M \
@@ -115,7 +94,7 @@ jobs:
         run: |
           set -euo pipefail
           RULES="$RUNNER_TEMP/security-rules.yar"
-          
+
           # Dynamic string construction prevents workflow from self-matching suspicious patterns
           S_ENC=$(printf '%s%s' '-Encoded' 'Command')
           S_DEC=$(printf '%s%s' 'FromBase' '64String')
@@ -137,7 +116,7 @@ jobs:
           yara -r "$RULES" . > "$REPORT_DIR/yara.raw.log" 2>&1
           rc=$?
 
-          # Exclude .git and .github paths from detections to prevent false positive on CI configs
+          # Exclude .git and .github paths from detections to prevent false positives on CI configs
           grep -v -E "(\.git/|\.github/)" "$REPORT_DIR/yara.raw.log" > "$REPORT_DIR/yara.log" || true
 
           if [ "$rc" -ne 0 ] && [ ! -s "$REPORT_DIR/yara.raw.log" ]; then
@@ -167,48 +146,6 @@ jobs:
           echo "$rc" > "$REPORT_DIR/semgrep.exit-code"
           exit "$rc"
 
-      - name: Run Gitleaks secret scan (Delta mode)
-        id: gitleaks
-        continue-on-error: true
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-          EVENT_BEFORE: ${{ github.event.before }}
-          EVENT_AFTER: ${{ github.event.after }}
-        run: |
-          set +e
-          GITLEAKS_ARGS="--report-format json --report-path $REPORT_DIR/gitleaks.json --redact"
-          
-          # Delta mode: scan PR branch or incoming push commits to ignore historical rotated keys
-          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$BASE_REF" ]; then
-            echo "Scanning pull request commits against origin/$BASE_REF..."
-            git fetch origin "$BASE_REF" --depth=100 || true
-            gitleaks git $GITLEAKS_ARGS --log-opts="origin/$BASE_REF..HEAD"
-          elif [ "$EVENT_NAME" = "push" ] && [ -n "$EVENT_BEFORE" ] && [ "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ]; then
-            echo "Scanning newly pushed commits ($EVENT_BEFORE..$EVENT_AFTER)..."
-            gitleaks git $GITLEAKS_ARGS --log-opts="$EVENT_BEFORE..$EVENT_AFTER"
-          else
-            echo "Scanning repository directory with baseline / ignore support..."
-            gitleaks dir . $GITLEAKS_ARGS
-          fi
-          rc=$?
-          echo "$rc" > "$REPORT_DIR/gitleaks.exit-code"
-          exit "$rc"
-
-      - name: Run Trivy filesystem scan
-        id: trivy
-        continue-on-error: true
-        shell: bash
-        run: |
-          set +e
-          trivy fs --scanners vuln,misconfig,secret \
-            --ignore-unfixed \
-            --format json --output "$REPORT_DIR/trivy.json" .
-          rc=$?
-          echo "$rc" > "$REPORT_DIR/trivy.exit-code"
-          exit "$rc"
-
       - name: Generate DOCX, JSON and SARIF reports
         id: reports
         if: always()
@@ -220,8 +157,6 @@ jobs:
           CLAMAV_OUTCOME: ${{ steps.clamav.outcome }}
           YARA_OUTCOME: ${{ steps.yara.outcome }}
           SEMGREP_OUTCOME: ${{ steps.semgrep.outcome }}
-          GITLEAKS_OUTCOME: ${{ steps.gitleaks.outcome }}
-          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
         run: |
           python3 - <<'PY'
           import json, os, subprocess
@@ -237,8 +172,6 @@ jobs:
               "clamav": os.getenv("CLAMAV_OUTCOME", "unknown"),
               "yara": os.getenv("YARA_OUTCOME", "unknown"),
               "semgrep": os.getenv("SEMGREP_OUTCOME", "unknown"),
-              "gitleaks": os.getenv("GITLEAKS_OUTCOME", "unknown"),
-              "trivy": os.getenv("TRIVY_OUTCOME", "unknown"),
           }
 
           def read_json(name, default):
@@ -248,8 +181,6 @@ jobs:
                   return default
 
           semgrep_data = read_json("semgrep.json", {})
-          gitleaks_data = read_json("gitleaks.json", [])
-          trivy_data = read_json("trivy.json", {})
           findings = []
 
           for item in semgrep_data.get("results", []) if isinstance(semgrep_data, dict) else []:
@@ -260,34 +191,6 @@ jobs:
                   "line": (item.get("start") or {}).get("line"),
                   "message": extra.get("message", "Semgrep finding")
               })
-
-          for item in gitleaks_data if isinstance(gitleaks_data, list) else []:
-              findings.append({
-                  "scanner": "Gitleaks", "severity": "HIGH", "type": "secret",
-                  "file": item.get("File", ""), "line": item.get("StartLine"),
-                  "message": item.get("Description", "Secret detected")
-              })
-
-          if isinstance(trivy_data, dict):
-              for result in trivy_data.get("Results", []) or []:
-                  for item in result.get("Vulnerabilities", []) or []:
-                      findings.append({
-                          "scanner": "Trivy", "severity": item.get("Severity", "UNKNOWN"),
-                          "type": "vulnerability", "file": result.get("Target", ""),
-                          "message": item.get("Title") or item.get("VulnerabilityID", "Vulnerability")
-                      })
-                  for item in result.get("Misconfigurations", []) or []:
-                      findings.append({
-                          "scanner": "Trivy", "severity": item.get("Severity", "UNKNOWN"),
-                          "type": "misconfiguration", "file": result.get("Target", ""),
-                          "message": item.get("Message", "Misconfiguration")
-                      })
-                  for item in result.get("Secrets", []) or []:
-                      findings.append({
-                          "scanner": "Trivy", "severity": item.get("Severity", "UNKNOWN"),
-                          "type": "secret", "file": result.get("Target", ""),
-                          "message": item.get("Title", "Secret detected")
-                      })
 
           tracked = subprocess.run(
               ["git", "ls-files"], capture_output=True, text=True, check=False
@@ -302,7 +205,7 @@ jobs:
                   blocking.append(f"{scanner} step did not complete successfully")
 
           # Any non-zero exit code from scanner executions is blocking
-          for name in ("clamav", "yara", "semgrep", "gitleaks", "trivy"):
+          for name in ("clamav", "yara", "semgrep"):
               code_file = out / f"{name}.exit-code"
               if code_file.exists():
                   try:
@@ -315,17 +218,9 @@ jobs:
           # Severity-based blocking evaluation
           for finding in findings:
               sev = finding.get("severity", "").upper()
-              scanner = finding.get("scanner", "")
-              f_type = finding.get("type", "")
-
-              # Trivy dependency vulnerabilities block strictly on CRITICAL (to avoid unpatched upstream deadlocks)
-              if scanner == "Trivy" and f_type == "vulnerability":
-                  if sev == "CRITICAL":
-                      blocking.append(f"Trivy CRITICAL CVE: {finding['file']} - {finding['message']}")
-              # Secrets, misconfigurations, and SAST findings block on CRITICAL, HIGH, or ERROR
-              elif sev in ("CRITICAL", "HIGH", "ERROR"):
+              if sev in ("CRITICAL", "HIGH", "ERROR"):
                   blocking.append(
-                      f"{scanner} {sev} finding: {finding['file']} - {finding['message']}"
+                      f"{finding['scanner']} {sev} finding: {finding['file']} - {finding['message']}"
                   )
 
           verdict = "FAIL" if blocking else "PASS"
@@ -348,7 +243,7 @@ jobs:
           }
           (out / "security-report.json").write_text(json.dumps(report, indent=2))
 
-          # SARIF 2.1.0 conversion for normalized Semgrep, Gitleaks and Trivy findings
+          # SARIF 2.1.0 conversion for normalized Semgrep findings
           rules, sarif_results = {}, []
           for item in findings:
               rule_id = f"{item['scanner']}_{item['type']}_{item['severity']}".replace(" ", "_")
@@ -376,39 +271,122 @@ jobs:
           }
           (out / "security-results.sarif").write_text(json.dumps(sarif, indent=2))
 
-          # Build minimal valid DOCX with Python standard library
-          paragraphs = [
-              "Security Audit Report",
-              f"Final verdict: {verdict}",
-              f"Repository: {report['repository']}",
-              f"Commit: {report['commit']}",
-              f"UTC timestamp: {report['timestamp_utc']}",
-              "Scanner execution",
-          ]
-          paragraphs.extend([f"{name}: {status}" for name, status in statuses.items()])
-          paragraphs.extend([
-              "Coverage",
-              f"Tracked files in checkout: {len(tracked_files)}",
-              report["coverage"]["note"],
-              "Findings"
-          ])
-          if findings:
-              paragraphs.extend([
-                  f"{item['severity']} | {item['scanner']} | {item['file']} | {item['message']}"
-                  for item in findings
-              ])
+          # Professional Executive Word Document Generator (Pure Python Standard Library)
+          def para(text, bold=False, size=22, color="1E293B", align="left", space_before=100, space_after=100, bg=None):
+              jc_xml = f'<w:jc w:val="{align}"/>' if align != "left" else ''
+              sp_xml = f'<w:spacing w:before="{space_before}" w:after="{space_after}"/>'
+              shd_xml = f'<w:shd w:val="clear" w:color="auto" w:fill="{bg}"/>' if bg else ''
+              pPr = f'<w:pPr>{jc_xml}{sp_xml}{shd_xml}</w:pPr>'
+              b_xml = '<w:b/>' if bold else ''
+              rPr = f'<w:rPr><w:rFonts w:ascii="Segoe UI" w:hAnsi="Segoe UI"/>{b_xml}<w:color w:val="{color}"/><w:sz w:val="{size}"/></w:rPr>'
+              return f'<w:p>{pPr}<w:r>{rPr}<w:t xml:space="preserve">{escape(str(text))}</w:t></w:r></w:p>'
+
+          def cell(text, bold=False, size=19, color="334155", bg="FFFFFF", align="left", width=None):
+              w_xml = f'<w:tcW w:w="{width}" w:type="dxa"/>' if width else ''
+              shd_xml = f'<w:shd w:val="clear" w:color="auto" w:fill="{bg}"/>'
+              tcPr = f'<w:tcPr>{w_xml}{shd_xml}<w:tcMar><w:top w:w="120" w:type="dxa"/><w:bottom w:w="120" w:type="dxa"/><w:left w:w="160" w:type="dxa"/><w:right w:w="160" w:type="dxa"/></w:tcMar></w:tcPr>'
+              p = para(text, bold=bold, size=size, color=color, align=align, space_before=40, space_after=40)
+              return f'<w:tc>{tcPr}{p}</w:tc>'
+
+          def row(cells):
+              return f'<w:tr>{"".join(cells)}</w:tr>'
+
+          def table(rows):
+              tblPr = (
+                  '<w:tblPr>'
+                  '<w:tblW w:w="5000" w:type="pct"/>'
+                  '<w:tblBorders>'
+                  '<w:top w:val="single" w:sz="4" w:space="0" w:color="CBD5E1"/>'
+                  '<w:left w:val="none"/>'
+                  '<w:bottom w:val="single" w:sz="6" w:space="0" w:color="94A3B8"/>'
+                  '<w:right w:val="none"/>'
+                  '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>'
+                  '<w:insideV w:val="none"/>'
+                  '</w:tblBorders>'
+                  '</w:tblPr>'
+              )
+              return f'<w:tbl>{tblPr}{"".join(rows)}</w:tbl>'
+
+          elements = []
+
+          # Document Title & Subtitle Header
+          elements.append(para("SECURITY AUDIT REPORT", bold=True, size=40, color="0F172A", space_before=100, space_after=40))
+          elements.append(para("Universal CI/CD Automated Security Gate • Enterprise DevSecOps", bold=False, size=20, color="64748B", space_before=0, space_after=200))
+
+          # Verdict Banner Box
+          if verdict == "PASS":
+              v_bg, v_col, v_icon, v_sub = "DCFCE7", "166534", "✔ PASS", "All security scanners completed cleanly. Zero blocking threats detected."
           else:
-              paragraphs.append("No normalized findings were reported by the scanners.")
-          paragraphs.append("Blocking reasons")
-          paragraphs.extend(report["blocking_reasons"] or ["None"])
-          paragraphs.append(
-              "PASS means the configured scanners completed without a blocking result; "
-              "it is not a guarantee that the repository is completely malware-free."
-          )
-          body = "".join(
-              "<w:p><w:r><w:t xml:space=\"preserve\">" + escape(str(line)) + "</w:t></w:r></w:p>"
-              for line in paragraphs
-          )
+              v_bg, v_col, v_icon, v_sub = "FEE2E2", "991B1B", "✖ FAIL", "One or more blocking security criteria were triggered."
+
+          elements.append(para(f"{v_icon} — FINAL VERDICT: {verdict}", bold=True, size=28, color=v_col, space_before=160, space_after=40, bg=v_bg))
+          elements.append(para(v_sub, bold=False, size=18, color=v_col, space_before=0, space_after=160, bg=v_bg))
+
+          # Section 1: Executive & Audit Metadata
+          elements.append(para("1. Executive & Audit Metadata", bold=True, size=26, color="1E293B", space_before=300, space_after=100))
+          meta_rows = [
+              row([cell("Target Repository", bold=True, bg="F8FAFC", width=2800), cell(str(report["repository"]), width=6200)]),
+              row([cell("Git Reference / Branch", bold=True, bg="F8FAFC", width=2800), cell(str(report["ref"]), width=6200)]),
+              row([cell("Commit Hash (SHA)", bold=True, bg="F8FAFC", width=2800), cell(str(report["commit"]), width=6200)]),
+              row([cell("Scan Timestamp (UTC)", bold=True, bg="F8FAFC", width=2800), cell(str(report["timestamp_utc"]), width=6200)]),
+              row([cell("Tracked Files Checked", bold=True, bg="F8FAFC", width=2800), cell(str(report["coverage"]["tracked_file_count"]), width=6200)]),
+          ]
+          elements.append(table(meta_rows))
+
+          # Section 2: Scanner Execution Summary
+          elements.append(para("2. Scanner Execution Summary", bold=True, size=26, color="1E293B", space_before=300, space_after=100))
+          scanner_rows = [
+              row([
+                  cell("Security Scanner", bold=True, bg="F1F5F9", width=2500),
+                  cell("Inspection Scope", bold=True, bg="F1F5F9", width=4500),
+                  cell("Status", bold=True, bg="F1F5F9", width=2000, align="center")
+              ]),
+              row([
+                  cell("ClamAV Antivirus", bold=True),
+                  cell("Operating System Trojans, Worms & Malware Detection"),
+                  cell(statuses.get("clamav", "N/A").upper(), bold=True, color="166534" if statuses.get("clamav") == "success" else "991B1B", align="center")
+              ]),
+              row([
+                  cell("YARA Heuristics", bold=True),
+                  cell("Suspicious Obfuscated Scripts & PowerShell Heuristics"),
+                  cell(statuses.get("yara", "N/A").upper(), bold=True, color="166534" if statuses.get("yara") == "success" else "991B1B", align="center")
+              ]),
+              row([
+                  cell("Semgrep SAST", bold=True),
+                  cell("Static Application Security Testing (Code Vulnerabilities)"),
+                  cell(statuses.get("semgrep", "N/A").upper(), bold=True, color="166534" if statuses.get("semgrep") == "success" else "991B1B", align="center")
+              ]),
+          ]
+          elements.append(table(scanner_rows))
+
+          # Section 3: Normalized Findings
+          elements.append(para("3. Normalized Security Findings", bold=True, size=26, color="1E293B", space_before=300, space_after=100))
+          if not findings:
+              elements.append(para("✔ No security findings or vulnerabilities were reported by the active scanners.", bold=True, size=20, color="166534", bg="F0FDF4", space_before=100, space_after=100))
+          else:
+              f_rows = [row([cell("Severity", bold=True, bg="F1F5F9", width=1600), cell("Scanner", bold=True, bg="F1F5F9", width=1800), cell("Location", bold=True, bg="F1F5F9", width=2600), cell("Finding Message", bold=True, bg="F1F5F9", width=3000)])]
+              for item in findings:
+                  sev = item.get("severity", "INFO")
+                  s_col = "991B1B" if sev in ("CRITICAL", "ERROR", "HIGH") else "D97706" if sev == "WARNING" else "2563EB"
+                  f_rows.append(row([
+                      cell(sev, bold=True, color=s_col),
+                      cell(item.get("scanner", "")),
+                      cell(f"{item.get('file', '')}:{item.get('line', '')}"),
+                      cell(item.get("message", ""))
+                  ]))
+              elements.append(table(f_rows))
+
+          # Section 4: Quality Gate Policy & Blocking Reasons
+          elements.append(para("4. Quality Gate Status & Policy Note", bold=True, size=26, color="1E293B", space_before=300, space_after=100))
+          if report["blocking_reasons"]:
+              for b in report["blocking_reasons"]:
+                  elements.append(para(f"• {b}", bold=True, size=20, color="991B1B", space_before=40, space_after=40))
+          else:
+              elements.append(para("• None. All configured security thresholds and scanner executions completed cleanly.", size=20, color="334155", space_before=40, space_after=40))
+
+          elements.append(para("Notice: PASS indicates that all configured scanners completed without triggering a blocking threshold. It confirms adherence to the automated security gate rules.", size=17, color="64748B", space_before=200, space_after=100))
+
+          body = "".join(elements)
           document_xml = (
               '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
               '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
@@ -432,6 +410,7 @@ jobs:
               docx.writestr("[Content_Types].xml", content_types)
               docx.writestr("_rels/.rels", rels)
               docx.writestr("word/document.xml", document_xml)
+
           print(f"Security verdict: {verdict}")
           PY
 

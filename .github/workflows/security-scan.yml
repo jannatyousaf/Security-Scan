@@ -6,8 +6,7 @@ on:
   pull_request:
     branches: ["**"]
   workflow_dispatch:
-  workflow_call:
-
+ 
 # This workflow only reads the repository. Do not add production credentials here.
 permissions:
   contents: read

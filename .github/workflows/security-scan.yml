@@ -45,27 +45,32 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/security-venv"
           "$RUNNER_TEMP/security-venv/bin/pip" install --upgrade pip
           "$RUNNER_TEMP/security-venv/bin/pip" install semgrep
+          
+          # Make binaries immediately available in this step and all subsequent steps
+          export PATH="$RUNNER_TEMP/security-venv/bin:/usr/local/bin:$PATH"
           echo "$RUNNER_TEMP/security-venv/bin" >> "$GITHUB_PATH"
 
-          # Install Trivy using official pre-built Linux 64-bit binary archive
+          # Install Trivy via official installer with automatic Debian package fallback
           TRIVY_VERSION="0.59.1"
-          curl -sSL --retry 3 --retry-delay 2 \
-            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
-            -o "$RUNNER_TEMP/trivy.tar.gz"
-          sudo tar -xz -C /usr/local/bin -f "$RUNNER_TEMP/trivy.tar.gz" trivy
-          sudo chmod +x /usr/local/bin/trivy
-          rm -f "$RUNNER_TEMP/trivy.tar.gz"
+          if ! curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin "v${TRIVY_VERSION}"; then
+            echo "Installing Trivy via official deb package fallback..."
+            curl -sSfL --retry 3 --retry-delay 2 \
+              "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.deb" \
+              -o "$RUNNER_TEMP/trivy.deb"
+            sudo dpkg -i "$RUNNER_TEMP/trivy.deb"
+            rm -f "$RUNNER_TEMP/trivy.deb"
+          fi
+          sudo chmod +x /usr/local/bin/trivy || true
 
           # Install Gitleaks using official pre-built Linux 64-bit binary archive
           GITLEAKS_VERSION="8.24.2"
-          curl -sSL --retry 3 --retry-delay 2 \
+          curl -sSfL --retry 3 --retry-delay 2 \
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-            -o "$RUNNER_TEMP/gitleaks.tar.gz"
-          sudo tar -xz -C /usr/local/bin -f "$RUNNER_TEMP/gitleaks.tar.gz" gitleaks
+            | sudo tar -xz -C /usr/local/bin gitleaks
           sudo chmod +x /usr/local/bin/gitleaks
-          rm -f "$RUNNER_TEMP/gitleaks.tar.gz"
 
           # Verify all tools exist and display versions
+          which semgrep trivy gitleaks yara clamscan
           semgrep --version
           trivy --version
           gitleaks version

@@ -1,0 +1,401 @@
+name: Security Scanning
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+# This workflow only reads the repository. Do not add production credentials here.
+permissions:
+  contents: read
+
+jobs:
+  security_gate:
+    name: Security Scan (Strict Gate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository and history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Create report directory
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/security-reports"
+          echo "REPORT_DIR=$RUNNER_TEMP/security-reports" >> "$GITHUB_ENV"
+
+      - name: Install scanners and report dependencies
+        id: install
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clamav clamav-freshclam yara python3-venv curl tar
+          python3 -m venv "$RUNNER_TEMP/security-venv"
+          "$RUNNER_TEMP/security-venv/bin/pip" install --upgrade pip
+          "$RUNNER_TEMP/security-venv/bin/pip" install semgrep
+          echo "$RUNNER_TEMP/security-venv/bin" >> "$GITHUB_PATH"
+          # Install Trivy using its official installer, pinned to a release version.
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/v0.59.1/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin v0.59.1
+          # Install Gitleaks using official pre-built binary release (fast & reliable).
+          GITLEAKS_VERSION="8.24.2"
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          semgrep --version
+          trivy --version
+          gitleaks version
+          yara --version
+          clamscan --version
+
+      - name: Update ClamAV signatures
+        id: clamav_db
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          sudo systemctl stop clamav-freshclam.service >/dev/null 2>&1 || true
+          if sudo freshclam --quiet; then
+            echo "ClamAV database successfully updated."
+          else
+            echo "::warning::ClamAV database update mirror rate-limited or unavailable. Continuing with bundled signatures."
+          fi
+          exit 0
+
+      - name: Scan repository with ClamAV
+        id: clamav
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          clamscan -r --infected --log="$REPORT_DIR/clamav.log" \
+            --exclude-dir='^(\.git|node_modules|venv|\.venv|dist|build|target|vendor|image_cache)' .
+          rc=$?
+          echo "$rc" > "$REPORT_DIR/clamav.exit-code"
+          # clamscan: 0 = clean, 1 = detection, 2 = operational error.
+          exit "$rc"
+
+      - name: Run YARA scan
+        id: yara
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          RULES="$RUNNER_TEMP/security-rules.yar"
+          cat > "$RULES" <<'RULES'
+          rule Suspicious_Encoded_PowerShell_Execution {
+            meta:
+              description = "Potential encoded PowerShell execution; review required"
+              severity = "high"
+            strings:
+              $encoded = "-EncodedCommand" ascii wide nocase
+              $decode = "FromBase64String" ascii wide nocase
+            condition:
+              all of them
+          }
+          RULES
+          set +e
+          yara -r "$RULES" . > "$REPORT_DIR/yara.log" 2>&1
+          rc=$?
+          echo "$rc" > "$REPORT_DIR/yara.exit-code"
+          # YARA's match output is treated as a detection; a non-zero exit is an error.
+          if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+          if [ -s "$REPORT_DIR/yara.log" ]; then exit 1; fi
+
+      - name: Run Semgrep SAST
+        id: semgrep
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          semgrep scan --config p/default --json \
+            --output "$REPORT_DIR/semgrep.json" .
+          rc=$?
+          echo "$rc" > "$REPORT_DIR/semgrep.exit-code"
+          exit "$rc"
+
+      - name: Run Gitleaks secret scan (Delta mode)
+        id: gitleaks
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          GITLEAKS_ARGS="--report-format json --report-path $REPORT_DIR/gitleaks.json --redact"
+          
+          # Delta mode: scan PR branch or incoming push commits to ignore historical rotated keys
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "${{ github.base_ref }}" ]; then
+            echo "Scanning pull request commits against origin/${{ github.base_ref }}..."
+            git fetch origin "${{ github.base_ref }}" --depth=100 || true
+            gitleaks git $GITLEAKS_ARGS --log-opts="origin/${{ github.base_ref }}..HEAD"
+          elif [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            echo "Scanning newly pushed commits (${{ github.event.before }}..${{ github.event.after }})..."
+            gitleaks git $GITLEAKS_ARGS --log-opts="${{ github.event.before }}..${{ github.event.after }}"
+          else
+            echo "Scanning repository directory with baseline / ignore support..."
+            gitleaks dir . $GITLEAKS_ARGS
+          fi
+          rc=$?
+          echo "$rc" > "$REPORT_DIR/gitleaks.exit-code"
+          exit "$rc"
+
+      - name: Run Trivy filesystem scan
+        id: trivy
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          trivy fs --scanners vuln,misconfig,secret \
+            --ignore-unfixed \
+            --format json --output "$REPORT_DIR/trivy.json" .
+          rc=$?
+          echo "$rc" > "$REPORT_DIR/trivy.exit-code"
+          exit "$rc"
+
+      - name: Generate DOCX, JSON and SARIF reports
+        id: reports
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          CLAMAV_DB_OUTCOME: ${{ steps.clamav_db.outcome }}
+          CLAMAV_OUTCOME: ${{ steps.clamav.outcome }}
+          YARA_OUTCOME: ${{ steps.yara.outcome }}
+          SEMGREP_OUTCOME: ${{ steps.semgrep.outcome }}
+          GITLEAKS_OUTCOME: ${{ steps.gitleaks.outcome }}
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          from datetime import datetime, timezone
+          from zipfile import ZipFile, ZIP_DEFLATED
+          from xml.sax.saxutils import escape
+
+          out = Path(os.environ["REPORT_DIR"])
+          statuses = {
+              "installation": os.getenv("INSTALL_OUTCOME", "unknown"),
+              "clamav_database_update": os.getenv("CLAMAV_DB_OUTCOME", "unknown"),
+              "clamav": os.getenv("CLAMAV_OUTCOME", "unknown"),
+              "yara": os.getenv("YARA_OUTCOME", "unknown"),
+              "semgrep": os.getenv("SEMGREP_OUTCOME", "unknown"),
+              "gitleaks": os.getenv("GITLEAKS_OUTCOME", "unknown"),
+              "trivy": os.getenv("TRIVY_OUTCOME", "unknown"),
+          }
+
+          def read_json(name, default):
+              try:
+                  return json.loads((out / name).read_text())
+              except Exception:
+                  return default
+
+          semgrep_data = read_json("semgrep.json", {})
+          gitleaks_data = read_json("gitleaks.json", [])
+          trivy_data = read_json("trivy.json", {})
+          findings = []
+
+          for item in semgrep_data.get("results", []) if isinstance(semgrep_data, dict) else []:
+              extra = item.get("extra", {})
+              findings.append({
+                  "scanner": "Semgrep", "severity": str(extra.get("severity", "INFO")).upper(),
+                  "type": "sast", "file": item.get("path", ""),
+                  "line": (item.get("start") or {}).get("line"),
+                  "message": extra.get("message", "Semgrep finding")
+              })
+
+          for item in gitleaks_data if isinstance(gitleaks_data, list) else []:
+              findings.append({
+                  "scanner": "Gitleaks", "severity": "HIGH", "type": "secret",
+                  "file": item.get("File", ""), "line": item.get("StartLine"),
+                  "message": item.get("Description", "Secret detected")
+              })
+
+          if isinstance(trivy_data, dict):
+              for result in trivy_data.get("Results", []) or []:
+                  for item in result.get("Vulnerabilities", []) or []:
+                      findings.append({
+                          "scanner": "Trivy", "severity": item.get("Severity", "UNKNOWN"),
+                          "type": "vulnerability", "file": result.get("Target", ""),
+                          "message": item.get("Title") or item.get("VulnerabilityID", "Vulnerability")
+                      })
+                  for item in result.get("Misconfigurations", []) or []:
+                      findings.append({
+                          "scanner": "Trivy", "severity": item.get("Severity", "UNKNOWN"),
+                          "type": "misconfiguration", "file": result.get("Target", ""),
+                          "message": item.get("Message", "Misconfiguration")
+                      })
+                  for item in result.get("Secrets", []) or []:
+                      findings.append({
+                          "scanner": "Trivy", "severity": item.get("Severity", "UNKNOWN"),
+                          "type": "secret", "file": result.get("Target", ""),
+                          "message": item.get("Title", "Secret detected")
+                      })
+
+          tracked = subprocess.run(
+              ["git", "ls-files"], capture_output=True, text=True, check=False
+          )
+          tracked_files = tracked.stdout.splitlines() if tracked.returncode == 0 else []
+
+          blocking = []
+          for scanner, outcome in statuses.items():
+              if outcome != "success":
+                  blocking.append(f"{scanner} step did not complete successfully")
+
+          # Any ClamAV non-zero result is blocking (detection or scanner error).
+          for name in ("clamav", "yara", "semgrep", "gitleaks", "trivy"):
+              code_file = out / f"{name}.exit-code"
+              if code_file.exists():
+                  try:
+                      code = int(code_file.read_text().strip())
+                      if code != 0:
+                          blocking.append(f"{name} returned exit code {code}")
+                  except Exception:
+                      blocking.append(f"{name} exit code could not be read")
+
+          for finding in findings:
+              if finding["severity"] in ("CRITICAL", "HIGH", "ERROR"):
+                  blocking.append(
+                      f"{finding['scanner']} {finding['severity']} finding: {finding['file']}"
+                  )
+
+          verdict = "FAIL" if blocking else "PASS"
+          report = {
+              "schema_version": "1.0",
+              "repository": os.getenv("GITHUB_REPOSITORY"),
+              "ref": os.getenv("GITHUB_REF"),
+              "commit": os.getenv("GITHUB_SHA"),
+              "run_id": os.getenv("GITHUB_RUN_ID"),
+              "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+              "verdict": verdict,
+              "coverage": {
+                  "tracked_file_count": len(tracked_files),
+                  "git_history_requested": True,
+                  "note": "Review scanner logs for unsupported formats, archive limits, submodule and LFS coverage. This workflow does not claim every byte of every format was understood by every scanner."
+              },
+              "scanner_status": statuses,
+              "findings": findings,
+              "blocking_reasons": sorted(set(blocking))
+          }
+          (out / "security-report.json").write_text(json.dumps(report, indent=2))
+
+          # SARIF 2.1.0 conversion for normalized Semgrep, Gitleaks and Trivy findings.
+          rules, sarif_results = {}, []
+          for item in findings:
+              rule_id = f"{item['scanner']}_{item['type']}_{item['severity']}".replace(" ", "_")
+              rules[rule_id] = {"id": rule_id, "shortDescription": {"text": item["message"][:200]}}
+              result = {
+                  "ruleId": rule_id,
+                  "level": "error" if item["severity"] in ("CRITICAL", "HIGH", "ERROR") else "warning",
+                  "message": {"text": item["message"]},
+                  "locations": []
+              }
+              if item.get("file"):
+                  physical = {"artifactLocation": {"uri": item["file"]}}
+                  if item.get("line"):
+                      physical["region"] = {"startLine": int(item["line"])}
+                  result["locations"] = [{"physicalLocation": physical}]
+              sarif_results.append(result)
+
+          sarif = {
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {"driver": {"name": "Repository Security Scanning", "rules": list(rules.values())}},
+                  "results": sarif_results
+              }]
+          }
+          (out / "security-results.sarif").write_text(json.dumps(sarif, indent=2))
+
+          # Build a valid minimal DOCX with Python's standard library so the
+          # audit report can still be created if scanner installation fails.
+          paragraphs = [
+              "Security Audit Report",
+              f"Final verdict: {verdict}",
+              f"Repository: {report['repository']}",
+              f"Commit: {report['commit']}",
+              f"UTC timestamp: {report['timestamp_utc']}",
+              "Scanner execution",
+          ]
+          paragraphs.extend([f"{name}: {status}" for name, status in statuses.items()])
+          paragraphs.extend([
+              "Coverage",
+              f"Tracked files in checkout: {len(tracked_files)}",
+              report["coverage"]["note"],
+              "Findings"
+          ])
+          if findings:
+              paragraphs.extend([
+                  f"{item['severity']} | {item['scanner']} | {item['file']} | {item['message']}"
+                  for item in findings
+              ])
+          else:
+              paragraphs.append("No normalized findings were reported by the scanners.")
+          paragraphs.append("Blocking reasons")
+          paragraphs.extend(report["blocking_reasons"] or ["None"])
+          paragraphs.append(
+              "PASS means the configured scanners completed without a blocking result; "
+              "it is not a guarantee that the repository is completely malware-free."
+          )
+          body = "".join(
+              "<w:p><w:r><w:t xml:space=\"preserve\">" + escape(str(line)) + "</w:t></w:r></w:p>"
+              for line in paragraphs
+          )
+          document_xml = (
+              '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+              '<w:body>' + body + '<w:sectPr/></w:body></w:document>'
+          )
+          content_types = (
+              '<?xml version="1.0" encoding="UTF-8"?>'
+              '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+              '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+              '<Default Extension="xml" ContentType="application/xml"/>'
+              '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+              '</Types>'
+          )
+          rels = (
+              '<?xml version="1.0" encoding="UTF-8"?>'
+              '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+              '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+              '</Relationships>'
+          )
+          with ZipFile(out / "Security_Audit_Report.docx", "w", ZIP_DEFLATED) as docx:
+              docx.writestr("[Content_Types].xml", content_types)
+              docx.writestr("_rels/.rels", rels)
+              docx.writestr("word/document.xml", document_xml)
+          print(f"Security verdict: {verdict}")
+          PY
+
+      - name: Upload security artifacts (on PASS and FAIL)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-${{ github.run_id }}
+          path: ${{ runner.temp }}/security-reports/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce strict security gate
+        if: always()
+        shell: bash
+        run: |
+          REPORT="$RUNNER_TEMP/security-reports/security-report.json"
+          if [ ! -f "$REPORT" ]; then
+            echo "Security report missing; blocking the workflow."
+            exit 1
+          fi
+          verdict="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("verdict", "FAIL"))' "$REPORT")"
+          if [ "$verdict" != "PASS" ]; then
+            echo "Security gate FAILED."
+            exit 1
+          fi
+          echo "Security gate PASSED."

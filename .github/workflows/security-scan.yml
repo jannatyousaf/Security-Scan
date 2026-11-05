@@ -6,14 +6,14 @@ on:
   pull_request:
     branches: ["**"]
   workflow_dispatch:
- 
+  workflow_call:
 # This workflow only reads the repository. Do not add production credentials here.
 permissions:
   contents: read
 
 jobs:
   security_gate:
-    name: Security Scan (Strict Gate)
+    name: Security Scan
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 

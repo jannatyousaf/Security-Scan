@@ -279,6 +279,8 @@ jobs:
               "schema_version": "1.0",
               "repository": os.getenv("GITHUB_REPOSITORY"),
               "ref": os.getenv("GITHUB_REF"),
+              "actor": os.getenv("GITHUB_ACTOR", "unknown"),
+              "event_name": os.getenv("GITHUB_EVENT_NAME", "unknown"),
               "commit": os.getenv("GITHUB_SHA"),
               "run_id": os.getenv("GITHUB_RUN_ID"),
               "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -382,6 +384,8 @@ jobs:
           meta_rows = [
               row([cell("Target Repository", bold=True, bg="F8FAFC", width=2800), cell(str(report["repository"]), width=6200)]),
               row([cell("Git Reference / Branch", bold=True, bg="F8FAFC", width=2800), cell(str(report["ref"]), width=6200)]),
+              row([cell("Triggered By (Actor)", bold=True, bg="F8FAFC", width=2800), cell(str(report["actor"]), width=6200)]),
+              row([cell("Event Type", bold=True, bg="F8FAFC", width=2800), cell(str(report["event_name"]), width=6200)]),
               row([cell("Commit Hash (SHA)", bold=True, bg="F8FAFC", width=2800), cell(str(report["commit"]), width=6200)]),
               row([cell("Scan Timestamp (UTC)", bold=True, bg="F8FAFC", width=2800), cell(str(report["timestamp_utc"]), width=6200)]),
               row([cell("Tracked Files Checked", bold=True, bg="F8FAFC", width=2800), cell(str(report["coverage"]["tracked_file_count"]), width=6200)]),

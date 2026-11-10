@@ -159,7 +159,7 @@ jobs:
           SEMGREP_OUTCOME: ${{ steps.semgrep.outcome }}
         run: |
           python3 - <<'PY'
-          import json, os, subprocess
+          import json, os, subprocess, re
           from pathlib import Path
           from datetime import datetime, timezone
           from zipfile import ZipFile, ZIP_DEFLATED
@@ -183,6 +183,7 @@ jobs:
           semgrep_data = read_json("semgrep.json", {})
           findings = []
 
+          # 1. Parse Semgrep SAST findings
           for item in semgrep_data.get("results", []) if isinstance(semgrep_data, dict) else []:
               extra = item.get("extra", {})
               findings.append({
@@ -191,6 +192,56 @@ jobs:
                   "line": (item.get("start") or {}).get("line"),
                   "message": extra.get("message", "Semgrep finding")
               })
+
+          # 2. Parse ClamAV log for infected files and scan stats
+          clamav_log = out / "clamav.log"
+          clamav_scanned_count = 0
+          clamav_infected_count = 0
+          if clamav_log.exists():
+              for line in clamav_log.read_text(errors="ignore").splitlines():
+                  line = line.strip()
+                  if "Scanned files:" in line:
+                      try:
+                          clamav_scanned_count = int(line.split(":")[-1].strip())
+                      except Exception:
+                          pass
+                  elif "Infected files:" in line:
+                      try:
+                          clamav_infected_count = int(line.split(":")[-1].strip())
+                      except Exception:
+                          pass
+                  if " FOUND" in line and not line.startswith("-----------"):
+                      parts = line.split(":", 1)
+                      file_path = parts[0].strip()
+                      virus_desc = parts[1].replace(" FOUND", "").strip() if len(parts) > 1 else "Malware detected"
+                      findings.append({
+                          "scanner": "ClamAV",
+                          "severity": "CRITICAL",
+                          "type": "malware",
+                          "file": file_path,
+                          "line": "-",
+                          "message": f"Malware signature match: {virus_desc}"
+                      })
+
+          # 3. Parse YARA log for heuristic matches
+          yara_log = out / "yara.log"
+          yara_match_count = 0
+          if yara_log.exists():
+              for line in yara_log.read_text(errors="ignore").splitlines():
+                  line = line.strip()
+                  if line and not line.startswith("error:"):
+                      yara_match_count += 1
+                      parts = line.split(None, 1)
+                      rule_name = parts[0].strip()
+                      file_path = parts[1].strip() if len(parts) > 1 else "repository"
+                      findings.append({
+                          "scanner": "YARA",
+                          "severity": "HIGH",
+                          "type": "heuristic",
+                          "file": file_path,
+                          "line": "-",
+                          "message": f"Heuristic rule matched: {rule_name}"
+                      })
 
           tracked = subprocess.run(
               ["git", "ls-files"], capture_output=True, text=True, check=False
@@ -272,14 +323,18 @@ jobs:
           (out / "security-results.sarif").write_text(json.dumps(sarif, indent=2))
 
           # Professional Executive Word Document Generator (Pure Python Standard Library)
+          def sanitize_text(text):
+              return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', str(text))
+
           def para(text, bold=False, size=22, color="1E293B", align="left", space_before=100, space_after=100, bg=None):
               jc_xml = f'<w:jc w:val="{align}"/>' if align != "left" else ''
               sp_xml = f'<w:spacing w:before="{space_before}" w:after="{space_after}"/>'
               shd_xml = f'<w:shd w:val="clear" w:color="auto" w:fill="{bg}"/>' if bg else ''
               pPr = f'<w:pPr>{jc_xml}{sp_xml}{shd_xml}</w:pPr>'
               b_xml = '<w:b/>' if bold else ''
+              clean_t = sanitize_text(text)
               rPr = f'<w:rPr><w:rFonts w:ascii="Segoe UI" w:hAnsi="Segoe UI"/>{b_xml}<w:color w:val="{color}"/><w:sz w:val="{size}"/></w:rPr>'
-              return f'<w:p>{pPr}<w:r>{rPr}<w:t xml:space="preserve">{escape(str(text))}</w:t></w:r></w:p>'
+              return f'<w:p>{pPr}<w:r>{rPr}<w:t xml:space="preserve">{escape(clean_t)}</w:t></w:r></w:p>'
 
           def cell(text, bold=False, size=19, color="334155", bg="FFFFFF", align="left", width=None):
               w_xml = f'<w:tcW w:w="{width}" w:type="dxa"/>' if width else ''
@@ -333,33 +388,50 @@ jobs:
           ]
           elements.append(table(meta_rows))
 
-          # Section 2: Scanner Execution Summary
+          # Section 2: Scanner Execution Summary with dynamic stats
           elements.append(para("2. Scanner Execution Summary", bold=True, size=26, color="1E293B", space_before=300, space_after=100))
+          
+          clamav_status = statuses.get("clamav", "N/A").upper()
+          clamav_col = "166534" if statuses.get("clamav") == "success" and clamav_infected_count == 0 else "991B1B"
+          if statuses.get("clamav") == "success":
+              clamav_status = f"SUCCESS ({clamav_scanned_count} files, {clamav_infected_count} infected)" if clamav_infected_count == 0 else f"INFECTION DETECTED ({clamav_infected_count} infected)"
+
+          yara_status = statuses.get("yara", "N/A").upper()
+          yara_col = "166534" if statuses.get("yara") == "success" and yara_match_count == 0 else "991B1B"
+          if statuses.get("yara") == "success":
+              yara_status = "SUCCESS (0 matches, Clean)" if yara_match_count == 0 else f"MATCHES FOUND ({yara_match_count} matches)"
+
+          semgrep_status = statuses.get("semgrep", "N/A").upper()
+          semgrep_findings_count = len([f for f in findings if f.get("scanner") == "Semgrep"])
+          semgrep_col = "166534" if statuses.get("semgrep") == "success" and semgrep_findings_count == 0 else ("991B1B" if any(f.get("severity") in ("CRITICAL", "ERROR") for f in findings if f.get("scanner") == "Semgrep") else "D97706")
+          if statuses.get("semgrep") == "success":
+              semgrep_status = "SUCCESS (0 findings, Clean)" if semgrep_findings_count == 0 else f"COMPLETED ({semgrep_findings_count} findings)"
+
           scanner_rows = [
               row([
                   cell("Security Scanner", bold=True, bg="F1F5F9", width=2500),
-                  cell("Inspection Scope", bold=True, bg="F1F5F9", width=4500),
-                  cell("Status", bold=True, bg="F1F5F9", width=2000, align="center")
+                  cell("Inspection Scope", bold=True, bg="F1F5F9", width=4200),
+                  cell("Status & Results", bold=True, bg="F1F5F9", width=2300, align="center")
               ]),
               row([
                   cell("ClamAV Antivirus", bold=True),
                   cell("Operating System Trojans, Worms & Malware Detection"),
-                  cell(statuses.get("clamav", "N/A").upper(), bold=True, color="166534" if statuses.get("clamav") == "success" else "991B1B", align="center")
+                  cell(clamav_status, bold=True, color=clamav_col, align="center")
               ]),
               row([
                   cell("YARA Heuristics", bold=True),
                   cell("Suspicious Obfuscated Scripts & PowerShell Heuristics"),
-                  cell(statuses.get("yara", "N/A").upper(), bold=True, color="166534" if statuses.get("yara") == "success" else "991B1B", align="center")
+                  cell(yara_status, bold=True, color=yara_col, align="center")
               ]),
               row([
                   cell("Semgrep SAST", bold=True),
                   cell("Static Application Security Testing (Code Vulnerabilities)"),
-                  cell(statuses.get("semgrep", "N/A").upper(), bold=True, color="166534" if statuses.get("semgrep") == "success" else "991B1B", align="center")
+                  cell(semgrep_status, bold=True, color=semgrep_col, align="center")
               ]),
           ]
           elements.append(table(scanner_rows))
 
-          # Section 3: Normalized Findings
+          # Section 3: Normalized Findings (Multi-Engine: Semgrep + ClamAV + YARA)
           elements.append(para("3. Normalized Security Findings", bold=True, size=26, color="1E293B", space_before=300, space_after=100))
           if not findings:
               elements.append(para("✔ No security findings or vulnerabilities were reported by the active scanners.", bold=True, size=20, color="166534", bg="F0FDF4", space_before=100, space_after=100))
@@ -368,10 +440,14 @@ jobs:
               for item in findings:
                   sev = item.get("severity", "INFO")
                   s_col = "991B1B" if sev in ("CRITICAL", "ERROR", "HIGH") else "D97706" if sev == "WARNING" else "2563EB"
+                  loc = item.get("file", "")
+                  line_no = item.get("line")
+                  if line_no and str(line_no) != "-":
+                      loc = f"{loc}:{line_no}"
                   f_rows.append(row([
                       cell(sev, bold=True, color=s_col),
                       cell(item.get("scanner", "")),
-                      cell(f"{item.get('file', '')}:{item.get('line', '')}"),
+                      cell(loc),
                       cell(item.get("message", ""))
                   ]))
               elements.append(table(f_rows))
